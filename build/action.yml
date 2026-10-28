@@ -1,0 +1,158 @@
+# Build an image without a Docker daemon, scan it, and push it to the project's registry prefix (write-once).
+#
+# Runs only on the runners umatix provides for a project (runs-on: <project>). They provide:
+#   BUILDKIT_HOST     the project's rootless buildkitd
+#   UMATIX_REGISTRY   the project's prefix in the registry, e.g. <registry>/<project>
+#   DOCKER_CONFIG     the push credential for that prefix (read and create, never overwrite)
+#   SSL_CERT_DIR      the CAs the registry's certificate needs
+# BuildKit writes an OCI layout, Trivy scans it (critical vulnerabilities that have a fix fail the build), crane
+# pushes it as $UMATIX_REGISTRY/<component>:sha-<revision>. A tag that exists is never overwritten.
+name: umatix build
+description: Build with BuildKit, scan with Trivy, push write-once to the project's registry prefix
+inputs:
+  component:
+    description: Image name under the project's prefix, e.g. engine (pushed as $UMATIX_REGISTRY/engine:sha-<revision>)
+    required: true
+  context:
+    description: Build context, relative to the workspace
+    default: .
+  dockerfile:
+    description: Dockerfile, relative to the workspace
+    default: Dockerfile
+  target:
+    description: Build stage (empty = the last stage)
+    default: ""
+  build-args:
+    description: Build arguments, one KEY=value per line
+    default: ""
+  revision:
+    description: Commit the image is built from and tagged with (default github.sha; set it in workflow_run triggers)
+    default: ""
+  push:
+    description: Push after a clean scan ("false" = build and scan only, e.g. for pull requests)
+    default: "false"
+outputs:
+  image:
+    description: Pushed reference (registry/prefix/component:tag), empty when not pushed
+    value: ${{ steps.push.outputs.image }}
+  tag:
+    description: Image tag (sha-<revision>)
+    value: ${{ steps.meta.outputs.tag }}
+  digest:
+    description: Digest of the pushed image, empty when not pushed
+    value: ${{ steps.push.outputs.digest }}
+runs:
+  using: composite
+  steps:
+    - name: Check the runner
+      shell: bash
+      run: |
+        set -euo pipefail
+        missing=()
+        for v in BUILDKIT_HOST UMATIX_REGISTRY DOCKER_CONFIG; do [[ -n "${!v:-}" ]] || missing+=("$v"); done
+        if (( ${#missing[@]} )); then
+          echo "::error::${missing[*]} not set: this action runs only on the runners umatix provides for a project"
+          exit 1
+        fi
+
+    - name: Install buildctl, trivy and crane
+      shell: bash
+      env:
+        BUILDKIT_VERSION: v0.34.0
+        BUILDKIT_SHA256: 14813b1fb2a40082114e6d386c6fc5e7dd5298176ce7ee1a18bc33e73e109ac3
+        TRIVY_VERSION: 0.75.0
+        TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+        CRANE_VERSION: v0.22.1
+        CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/umatix-bin"
+        # Once per job: a second build in the same job reuses the tools.
+        if [[ ! -x "$bin/crane" ]]; then
+          mkdir -p "$bin" "$RUNNER_TEMP/umatix-dl"; cd "$RUNNER_TEMP/umatix-dl"
+          fetch() { curl -fsSL --retry 3 -o "$2" "$1" && echo "$3  $2" | sha256sum -c --quiet -; }
+          fetch "https://github.com/moby/buildkit/releases/download/$BUILDKIT_VERSION/buildkit-$BUILDKIT_VERSION.linux-amd64.tar.gz" \
+            buildkit.tgz "$BUILDKIT_SHA256"
+          tar xzf buildkit.tgz -C "$bin" --strip-components=1 bin/buildctl
+          fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            trivy.tgz "$TRIVY_SHA256"
+          tar xzf trivy.tgz -C "$bin" trivy
+          fetch "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz" \
+            crane.tgz "$CRANE_SHA256"
+          tar xzf crane.tgz -C "$bin" crane
+          cd - >/dev/null && rm -rf "$RUNNER_TEMP/umatix-dl"
+        fi
+        echo "$bin" >>"$GITHUB_PATH"
+
+    - name: Image name and tag
+      id: meta
+      shell: bash
+      env:
+        COMPONENT: ${{ inputs.component }}
+        REVISION: ${{ inputs.revision || github.sha }}
+      run: |
+        set -euo pipefail
+        [[ "$COMPONENT" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$ ]] || {
+          echo "::error::invalid component name: $COMPONENT"; exit 1; }
+        [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::revision is not a full commit sha: $REVISION"; exit 1; }
+        work="$RUNNER_TEMP/umatix-build/${COMPONENT//\//_}"
+        rm -rf "$work" && mkdir -p "$work"
+        {
+          echo "tag=sha-$REVISION"
+          echo "ref=${UMATIX_REGISTRY%/}/$COMPONENT:sha-$REVISION"
+          echo "revision=$REVISION"
+          echo "work=$work"
+        } >>"$GITHUB_OUTPUT"
+
+    - name: Build (BuildKit, OCI layout)
+      shell: bash
+      env:
+        CONTEXT: ${{ inputs.context }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        TARGET: ${{ inputs.target }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+        REVISION: ${{ steps.meta.outputs.revision }}
+        WORK: ${{ steps.meta.outputs.work }}
+      run: |
+        set -euo pipefail
+        opts=(--opt "platform=linux/amd64" --opt "filename=$(basename "$DOCKERFILE")")
+        [[ -n "$TARGET" ]] && opts+=(--opt "target=$TARGET")
+        while IFS= read -r arg; do
+          [[ -n "$arg" ]] && opts+=(--opt "build-arg:$arg")
+        done <<<"$BUILD_ARGS"
+        buildctl build --frontend dockerfile.v0 \
+          --local "context=$CONTEXT" --local "dockerfile=$(dirname "$DOCKERFILE")" "${opts[@]}" \
+          --opt "label:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+          --opt "label:org.opencontainers.image.revision=$REVISION" \
+          --output "type=oci,dest=$WORK/image.tar"
+        mkdir -p "$WORK/image" && tar xf "$WORK/image.tar" -C "$WORK/image" && rm "$WORK/image.tar"
+
+    # Trivy reads the OCI layout directory, not the tarball.
+    - name: Scan (Trivy, critical vulnerabilities with a fix)
+      shell: bash
+      env:
+        WORK: ${{ steps.meta.outputs.work }}
+      run: |
+        set -euo pipefail
+        trivy image --input "$WORK/image" --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 \
+          --no-progress
+
+    - name: Push (write-once)
+      id: push
+      if: inputs.push == 'true'
+      shell: bash
+      env:
+        REF: ${{ steps.meta.outputs.ref }}
+        WORK: ${{ steps.meta.outputs.work }}
+      run: |
+        set -euo pipefail
+        if existing="$(crane digest "$REF" 2>/dev/null)"; then
+          echo "::notice::$REF already exists ($existing); tags are never overwritten"
+          digest="$existing"
+        else
+          crane push --index "$WORK/image" "$REF"
+          digest="$(crane digest "$REF")"
+        fi
+        echo "image=$REF" >>"$GITHUB_OUTPUT"
+        echo "digest=$digest" >>"$GITHUB_OUTPUT"
+        echo "Pushed \`$REF\` (\`$digest\`)" >>"$GITHUB_STEP_SUMMARY"
