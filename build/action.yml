@@ -31,6 +31,11 @@ inputs:
   push:
     description: Push after a clean scan ("false" = build and scan only, e.g. for pull requests)
     default: "false"
+  ignore-file:
+    description: >-
+      A Trivy ignore file for this image only, relative to the workspace (.trivyignore or .trivyignore.yaml with
+      reasons and expiry dates); empty = no exceptions
+    default: ""
 outputs:
   image:
     description: Pushed reference (registry/prefix/component:tag), empty when not pushed
@@ -132,10 +137,18 @@ runs:
       shell: bash
       env:
         WORK: ${{ steps.meta.outputs.work }}
+        IGNORE_FILE: ${{ inputs.ignore-file }}
       run: |
         set -euo pipefail
+        # An empty ignore file name keeps Trivy from reading a .trivyignore of the repository for every image.
+        ignore=(--ignorefile /dev/null)
+        if [[ -n "$IGNORE_FILE" ]]; then
+          [[ -f "$IGNORE_FILE" ]] || { echo "::error::ignore-file $IGNORE_FILE does not exist"; exit 1; }
+          ignore=(--ignorefile "$IGNORE_FILE")
+          echo "::notice::scanning with the exceptions in $IGNORE_FILE"
+        fi
         trivy image --input "$WORK/image" --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 \
-          --no-progress
+          --no-progress "${ignore[@]}"
 
     - name: Push (write-once)
       id: push

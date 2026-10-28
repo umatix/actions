@@ -89,3 +89,16 @@ jobs:
         env:
           OUTCOME: ${{ steps.refuse.outcome }}
         run: test "$OUTCOME" = failure
+      - name: A missing ignore file is an error, not an empty exception list
+        id: missing-ignore
+        continue-on-error: true
+        uses: ./build
+        with:
+          component: greeting
+          dockerfile: testdata/Dockerfile
+          context: testdata
+          ignore-file: testdata/no-such-ignore-file.yaml
+      - name: It did fail
+        env:
+          OUTCOME: ${{ steps.missing-ignore.outcome }}
+        run: test "$OUTCOME" = failure
