@@ -140,11 +140,11 @@ runs:
         IGNORE_FILE: ${{ inputs.ignore-file }}
       run: |
         set -euo pipefail
-        # An empty ignore file name keeps Trivy from reading a .trivyignore of the repository for every image.
-        ignore=(--ignorefile /dev/null)
+        # Empty files keep Trivy from reading a .trivyignore or trivy.yaml of the repository for every image.
+        ignore=(--config /dev/null --ignorefile /dev/null)
         if [[ -n "$IGNORE_FILE" ]]; then
           [[ -f "$IGNORE_FILE" ]] || { echo "::error::ignore-file $IGNORE_FILE does not exist"; exit 1; }
-          ignore=(--ignorefile "$IGNORE_FILE")
+          ignore=(--config /dev/null --ignorefile "$IGNORE_FILE")
           echo "::notice::scanning with the exceptions in $IGNORE_FILE"
         fi
         trivy image --input "$WORK/image" --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 \
