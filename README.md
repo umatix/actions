@@ -51,8 +51,15 @@ jobs:
 | `build-args` | none | One `KEY=value` per line |
 | `revision` | `github.sha` | Commit the image is built from and tagged with; set it under `workflow_run` |
 | `push` | `false` | `true` pushes after a clean scan; anything else builds and scans only |
+| `ignore-file` | none | A Trivy ignore file for this image only (see below) |
 
 Outputs: `image` (the pushed reference, empty without push), `tag` (`sha-<revision>`), `digest`.
+
+**Exceptions.** A critical vulnerability with a fix fails the step. When one cannot be fixed yet (an upstream that
+no longer ships fixed images), list it in an ignore file and pass it with `ignore-file` for that one image: Trivy's
+`.trivyignore.yaml` lets every entry name the affected paths, a statement why it does not apply, and an expiry
+(`expired_at`): from that date, 00:00 UTC, the gate fails again. Neither a `.trivyignore` nor a `trivy.yaml` in the
+repository is read on its own, so no exception reaches an image by accident.
 
 The images are `linux/amd64`. Releases are immutable tags (`v1.0.0`, `v1.1.0`, …); pin one, or a commit.
 
